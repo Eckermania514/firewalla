@@ -160,4 +160,4 @@ def action():
 
 if __name__ == "__main__":
     # Use port 8080 (no root required). Change to 80 only if you run as root.
-    app.run(host="0.0.0.0", port=80, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)
