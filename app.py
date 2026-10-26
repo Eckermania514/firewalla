@@ -3,7 +3,7 @@
 Firewalla Device Dashboard
 - Gradient borders by state
 - Groups + detail pages
-- WebSocket live rates from timedTraffic (1-minute) + lastsumflow fallback
+- WebSocket live rates from timedTraffic (1-minute average) + lastsumflow fallback
 """
 
 from flask import Flask, render_template_string, request, redirect, url_for
@@ -361,30 +361,31 @@ def parse_tags(data):
     return [str(tags)]
 
 def latest_timed_bytes(mac, direction):
-    """Return bytes from the newest timedTraffic:direction:MAC:1minute:* key."""
+    """Return (bytes, timestamp) from the newest timedTraffic:direction:MAC:1minute:* key."""
     for m in (mac, mac.upper(), mac.lower()):
         pattern = f"timedTraffic:{direction}:{m}:1minute:*"
         keys = r.keys(pattern)
         if not keys:
             continue
-        # newest window = highest timestamp
         best_key = max(keys, key=lambda k: int(k.rsplit(":", 1)[-1]))
         try:
             val = r.get(best_key)
             if val is not None:
-                return int(float(val))
+                ts = int(best_key.rsplit(":", 1)[-1])
+                return int(float(val)), ts
         except Exception:
             continue
-    return 0
+    return 0, 0
 
 def flow_total_bytes(mac, direction):
     """
-    Prefer the live 1-minute timedTraffic keys (they actually change).
-    Fall back to classic lastsumflow → zset if no timedTraffic exists yet.
+    Prefer the live 1-minute timedTraffic keys.
+    Fall back to classic lastsumflow → zset if none exist.
+    Returns (bytes, is_timed).
     """
-    timed = latest_timed_bytes(mac, direction)
+    timed, _ = latest_timed_bytes(mac, direction)
     if timed > 0:
-        return timed
+        return timed, True
 
     # fallback
     for m in (mac, mac.upper(), mac.lower()):
@@ -394,10 +395,10 @@ def flow_total_bytes(mac, direction):
         try:
             items = r.zrange(ptr, 0, -1, withscores=True)
             if items:
-                return int(sum(float(score) for _, score in items))
+                return int(sum(float(score) for _, score in items)), False
         except Exception:
             continue
-    return 0
+    return 0, False
 
 def load_devices():
     devices = []
@@ -423,13 +424,24 @@ def load_devices():
         tags = parse_tags(data)
         group = ", ".join(tags) if tags else (data.get("groupName") or data.get("group") or "Ungrouped")
 
-        down_total = flow_total_bytes(mac_raw, "download")
-        up_total = flow_total_bytes(mac_raw, "upload")
+        down_total, down_is_timed = flow_total_bytes(mac_raw, "download")
+        up_total,   up_is_timed   = flow_total_bytes(mac_raw, "upload")
 
-        down_rate = up_rate = 0.0
+        # Convert 1-minute window totals into average rates (bytes / 60)
+        if down_is_timed:
+            down_rate = down_total / 60.0
+        else:
+            down_rate = 0.0
+
+        if up_is_timed:
+            up_rate = up_total / 60.0
+        else:
+            up_rate = 0.0
+
+        # Keep classic delta logic as secondary source when timedTraffic is missing
         with _prev_lock:
             prev = _prev.get(mac)
-            if prev:
+            if prev and not (down_is_timed or up_is_timed):
                 dts = max(now - prev[0], 0.001)
                 if down_total >= prev[1]:
                     down_rate = (down_total - prev[1]) / dts
@@ -437,11 +449,10 @@ def load_devices():
                     up_rate = (up_total - prev[2]) / dts
             _prev[mac] = (now, down_total, up_total)
 
-        # Show rate if we have a previous sample; else show totals so meters aren't empty on first paint
-        if prev is not None:
-            down_show, up_show, is_rate = down_rate, up_rate, True
-        else:
-            down_show, up_show, is_rate = float(down_total), float(up_total), False
+        is_rate = down_is_timed or up_is_timed or (prev is not None)
+
+        down_show = down_rate if is_rate else float(down_total)
+        up_show   = up_rate   if is_rate else float(up_total)
 
         if not online:
             glow, badge_class, status_label = "grey", "off", "Offline"
