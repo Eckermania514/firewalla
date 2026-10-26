@@ -3,7 +3,7 @@
 Firewalla Device Dashboard
 - Gradient borders by state
 - Groups + detail pages
-- WebSocket live rates from lastsumflow/sumflow
+- WebSocket live rates from timedTraffic (1-minute) + lastsumflow fallback
 """
 
 from flask import Flask, render_template_string, request, redirect, url_for
@@ -265,38 +265,26 @@ DETAIL_TPL = r"""
     .btn { border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; padding: 11px 16px;
            font-size: 0.85rem; font-weight: 600; cursor: pointer; color: #fff; background: rgba(255,255,255,0.08); }
     .btn.pause { background: rgba(251,191,36,0.25); }
-    .btn.unpause { background: rgba(52,211,153,0.25); }
-    .btn.quarantine { background: rgba(248,113,113,0.25); }
-    .btn.unquarantine { background: rgba(91,140,255,0.25); }
-    h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 22px 0 10px; }
-    .section { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; overflow: hidden; }
+    .section { background: #0c1220; border-radius: 16px; padding: 18px; margin-bottom: 18px; }
+    h2 { font-size: 1.05rem; margin-bottom: 12px; }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); vertical-align: top; }
-    th { color: var(--muted); font-weight: 500; width: 34%; }
-    td { word-break: break-word; font-family: ui-monospace, monospace; font-size: 0.82rem; }
+    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    th { color: var(--muted); width: 160px; font-weight: 500; }
   </style>
 </head>
 <body>
+  <a class="back" href="/">← Back to dashboard</a>
   <div class="wrap">
-    <a class="back" href="{{ url_for('index') }}">← All devices</a>
     <div class="shell glow-{{ d.glow }}">
       <div class="hero">
         <h1>{{ d.name }}</h1>
-        <div class="sub">{{ d.vendor or "Unknown vendor" }} · {{ d.mac }}</div>
+        <div class="sub">{{ d.vendor or "Unknown vendor" }}</div>
         <div class="badges">
           <span class="badge {{ d.badge_class }}">{{ d.status_label }}</span>
-          {% if d.group %}<span class="badge off">{{ d.group }}</span>{% endif %}
         </div>
-        <form class="actions" method="post" action="{{ url_for('action') }}">
-          <input type="hidden" name="mac" value="{{ d.mac }}">
-          <input type="hidden" name="next" value="{{ url_for('device', mac=d.mac) }}">
-          <button class="btn pause" name="action" value="pause">Pause</button>
-          <button class="btn unpause" name="action" value="unpause">Unpause</button>
-          <button class="btn quarantine" name="action" value="quarantine">Quarantine</button>
-          <button class="btn unquarantine" name="action" value="unquarantine">Release</button>
-        </form>
       </div>
     </div>
+
     <h2>Summary</h2>
     <div class="section">
       <table>
@@ -372,17 +360,41 @@ def parse_tags(data):
         pass
     return [str(tags)]
 
+def latest_timed_bytes(mac, direction):
+    """Return bytes from the newest timedTraffic:direction:MAC:1minute:* key."""
+    for m in (mac, mac.upper(), mac.lower()):
+        pattern = f"timedTraffic:{direction}:{m}:1minute:*"
+        keys = r.keys(pattern)
+        if not keys:
+            continue
+        # newest window = highest timestamp
+        best_key = max(keys, key=lambda k: int(k.rsplit(":", 1)[-1]))
+        try:
+            val = r.get(best_key)
+            if val is not None:
+                return int(float(val))
+        except Exception:
+            continue
+    return 0
+
 def flow_total_bytes(mac, direction):
-    """Sum scores from the zset pointed to by lastsumflow:MAC:download|upload."""
+    """
+    Prefer the live 1-minute timedTraffic keys (they actually change).
+    Fall back to classic lastsumflow → zset if no timedTraffic exists yet.
+    """
+    timed = latest_timed_bytes(mac, direction)
+    if timed > 0:
+        return timed
+
+    # fallback
     for m in (mac, mac.upper(), mac.lower()):
         ptr = r.get(f"lastsumflow:{m}:{direction}")
         if not ptr:
             continue
         try:
             items = r.zrange(ptr, 0, -1, withscores=True)
-            if items is None:
-                continue
-            return int(sum(float(score) for _, score in items))
+            if items:
+                return int(sum(float(score) for _, score in items))
         except Exception:
             continue
     return 0
@@ -442,8 +454,6 @@ def load_devices():
         uv, uu = split_human(up_show, is_rate=is_rate)
         dth, _ = split_human(down_total, is_rate=False)
         uth, _ = split_human(up_total, is_rate=False)
-        dtu = split_human(down_total, is_rate=False)[1]
-        utu = split_human(up_total, is_rate=False)[1]
 
         devices.append({
             "mac": mac,
@@ -460,10 +470,8 @@ def load_devices():
             "down_show": down_show,
             "up_show": up_show,
             "is_rate": is_rate,
-            "down_total": down_total,
-            "up_total": up_total,
-            "down_total_h": f"{dth} {dtu}",
-            "up_total_h": f"{uth} {utu}",
+            "down_total_h": dth,
+            "up_total_h": uth,
             "download_val": dv,
             "download_unit": du,
             "upload_val": uv,
