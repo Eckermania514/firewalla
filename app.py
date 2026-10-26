@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 Firewalla Device Dashboard
-- Device grid with gradient borders (green/red/grey)
-- Grouped by tags
-- Detail page with full Redis dump
-- WebSocket live traffic streaming
+- Gradient borders by state
+- Groups + detail pages
+- WebSocket live rates from lastsumflow/sumflow
 """
 
 from flask import Flask, render_template_string, request, redirect, url_for
@@ -21,8 +20,6 @@ sock = Sock(app)
 r = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)
 
 ARC_LEN = 125.66
-
-# Previous sample for rate calculation: mac -> (ts, down_bytes, up_bytes)
 _prev = {}
 _prev_lock = threading.Lock()
 
@@ -192,46 +189,27 @@ INDEX_TPL = r"""
   </div>
 
 <script>
-const ARC = 125.66;
-const statusEl = document.getElementById('ws-status');
-
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(proto + '://' + location.host + '/ws');
-
-  ws.onopen = () => {
-    statusEl.textContent = 'Live';
-    statusEl.className = 'ws-status live';
-  };
-  ws.onclose = () => {
-    statusEl.textContent = 'Reconnecting…';
-    statusEl.className = 'ws-status dead';
-    setTimeout(connect, 2000);
-  };
+  const statusEl = document.getElementById('ws-status');
+  ws.onopen = () => { statusEl.textContent = 'Live'; statusEl.className = 'ws-status live'; };
+  ws.onclose = () => { statusEl.textContent = 'Reconnecting…'; statusEl.className = 'ws-status dead'; setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
-
   ws.onmessage = (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type !== 'snapshot') return;
-
     document.getElementById('clock').textContent = msg.now;
     document.getElementById('device-count').textContent = msg.total;
-
     for (const d of msg.devices) {
       const mac = d.mac;
       const shell = document.getElementById('shell-' + mac);
       if (!shell) continue;
-
       shell.className = 'card-shell glow-' + d.glow;
       const badge = document.getElementById('badge-' + mac);
-      if (badge) {
-        badge.className = 'badge ' + d.badge_class;
-        badge.textContent = d.status_label;
-      }
+      if (badge) { badge.className = 'badge ' + d.badge_class; badge.textContent = d.status_label; }
       const ip = document.getElementById('ip-' + mac);
       if (ip) ip.textContent = d.ip || '—';
-
       const vd = document.getElementById('val-down-' + mac);
       const ud = document.getElementById('unit-down-' + mac);
       const vu = document.getElementById('val-up-' + mac);
@@ -240,12 +218,10 @@ function connect() {
       if (ud) ud.textContent = d.download_unit;
       if (vu) vu.textContent = d.upload_val;
       if (uu) uu.textContent = d.upload_unit;
-
       const ad = document.getElementById('arc-down-' + mac);
       const au = document.getElementById('arc-up-' + mac);
       if (ad) ad.setAttribute('stroke-dasharray', d.down_arc + ' 200');
       if (au) au.setAttribute('stroke-dasharray', d.up_arc + ' 200');
-
       const pf = document.getElementById('pct-' + mac);
       const pt = document.getElementById('pct-txt-' + mac);
       if (pf) pf.style.width = d.pct + '%';
@@ -331,8 +307,10 @@ DETAIL_TPL = r"""
         <tr><th>Online</th><td>{{ "Yes" if d.online else "No" }}</td></tr>
         <tr><th>Monitoring</th><td>{{ "Paused" if d.paused else "Active" }}</td></tr>
         <tr><th>Last active</th><td>{{ d.last_active_human }}</td></tr>
-        <tr><th>Download (rate or total)</th><td>{{ d.download_val }} {{ d.download_unit }}</td></tr>
-        <tr><th>Upload (rate or total)</th><td>{{ d.upload_val }} {{ d.upload_unit }}</td></tr>
+        <tr><th>Download total</th><td>{{ d.down_total_h }}</td></tr>
+        <tr><th>Upload total</th><td>{{ d.up_total_h }}</td></tr>
+        <tr><th>Download rate</th><td>{{ d.download_val }} {{ d.download_unit }}</td></tr>
+        <tr><th>Upload rate</th><td>{{ d.upload_val }} {{ d.upload_unit }}</td></tr>
       </table>
     </div>
     <h2>All Redis fields</h2>
@@ -356,13 +334,11 @@ def split_human(n, is_rate=False):
     units = ["B/s", "KB/s", "MB/s", "GB/s"] if is_rate else ["B", "KB", "MB", "GB", "TB"]
     for unit in units:
         if abs(n) < 1024:
-            if abs(n) < 10:
-                return f"{n:.1f}", unit
-            return f"{n:.0f}", unit
+            return (f"{n:.1f}" if abs(n) < 10 else f"{n:.0f}"), unit
         n /= 1024
     return f"{n:.1f}", units[-1]
 
-def meter_pct_from_rate(bps, scale=50_000_000):
+def meter_pct(bps, scale=10_000_000):
     try:
         return max(0.0, min(100.0, (float(bps) / scale) * 100))
     except (TypeError, ValueError):
@@ -396,37 +372,33 @@ def parse_tags(data):
         pass
     return [str(tags)]
 
-def pick_bytes(data, keys):
-    for k in keys:
-        if k in data and data[k] not in (None, "", "null"):
-            try:
-                return int(float(data[k]))
-            except (TypeError, ValueError):
+def flow_total_bytes(mac, direction):
+    """Sum scores from the zset pointed to by lastsumflow:MAC:download|upload."""
+    for m in (mac, mac.upper(), mac.lower()):
+        ptr = r.get(f"lastsumflow:{m}:{direction}")
+        if not ptr:
+            continue
+        try:
+            items = r.zrange(ptr, 0, -1, withscores=True)
+            if items is None:
                 continue
+            return int(sum(float(score) for _, score in items))
+        except Exception:
+            continue
     return 0
 
 def load_devices():
-    """Load devices and compute live rates from successive samples."""
     devices = []
     now = time.time()
     total_rate = 0.0
-
-    down_keys = (
-        "download", "rx", "rxBytes", "downloadBytes", "totalDownload",
-        "bytes:download", "download:24h", "rx_bytes", "inBytes",
-    )
-    up_keys = (
-        "upload", "tx", "txBytes", "uploadBytes", "totalUpload",
-        "bytes:upload", "upload:24h", "tx_bytes", "outBytes",
-    )
 
     for key in r.keys("host:mac:*"):
         data = r.hgetall(key)
         if not data:
             continue
 
-        # Full MAC: host:mac:AA:BB:CC:DD:EE:FF
-        mac = key.replace("host:mac:", "", 1).upper()
+        mac_raw = key.replace("host:mac:", "", 1)
+        mac = mac_raw.upper()
         name = data.get("name") or data.get("bname") or data.get("dhcpName") or mac
         ip = data.get("ipv4Addr") or data.get("ipv4") or data.get("ip") or ""
         vendor = data.get("macVendor") or data.get("vendor") or ""
@@ -435,35 +407,29 @@ def load_devices():
         online = (now - last) < 600 if last else False
         last_human = datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S") if last else "—"
 
-        paused, _policy = parse_policy(data)
+        paused, _ = parse_policy(data)
         tags = parse_tags(data)
         group = ", ".join(tags) if tags else (data.get("groupName") or data.get("group") or "Ungrouped")
 
-        down_total = pick_bytes(data, down_keys)
-        up_total = pick_bytes(data, up_keys)
+        down_total = flow_total_bytes(mac_raw, "download")
+        up_total = flow_total_bytes(mac_raw, "upload")
 
-        # Rate from delta vs previous sample
-        down_rate = 0.0
-        up_rate = 0.0
+        down_rate = up_rate = 0.0
         with _prev_lock:
             prev = _prev.get(mac)
             if prev:
                 dts = max(now - prev[0], 0.001)
-                # Only use delta if counters moved forward (not reset)
                 if down_total >= prev[1]:
                     down_rate = (down_total - prev[1]) / dts
                 if up_total >= prev[2]:
                     up_rate = (up_total - prev[2]) / dts
             _prev[mac] = (now, down_total, up_total)
 
-        # Prefer live rate; fall back to showing cumulative totals
-        use_rate = (down_rate > 0 or up_rate > 0) or (down_total == 0 and up_total == 0)
-        if use_rate and (down_rate > 0 or up_rate > 0 or prev is not None):
-            down_show, up_show = down_rate, up_rate
-            is_rate = True
+        # Show rate if we have a previous sample; else show totals so meters aren't empty on first paint
+        if prev is not None:
+            down_show, up_show, is_rate = down_rate, up_rate, True
         else:
-            down_show, up_show = float(down_total), float(up_total)
-            is_rate = False
+            down_show, up_show, is_rate = float(down_total), float(up_total), False
 
         if not online:
             glow, badge_class, status_label = "grey", "off", "Offline"
@@ -471,6 +437,13 @@ def load_devices():
             glow, badge_class, status_label = "red", "paused", "Paused"
         else:
             glow, badge_class, status_label = "green", "on", "Online"
+
+        dv, du = split_human(down_show, is_rate=is_rate)
+        uv, uu = split_human(up_show, is_rate=is_rate)
+        dth, _ = split_human(down_total, is_rate=False)
+        uth, _ = split_human(up_total, is_rate=False)
+        dtu = split_human(down_total, is_rate=False)[1]
+        utu = split_human(up_total, is_rate=False)[1]
 
         devices.append({
             "mac": mac,
@@ -489,6 +462,12 @@ def load_devices():
             "is_rate": is_rate,
             "down_total": down_total,
             "up_total": up_total,
+            "down_total_h": f"{dth} {dtu}",
+            "up_total_h": f"{uth} {utu}",
+            "download_val": dv,
+            "download_unit": du,
+            "upload_val": uv,
+            "upload_unit": uu,
             "raw_fields": sorted(data.items()),
         })
         total_rate += down_show + up_show
@@ -496,12 +475,9 @@ def load_devices():
     for d in devices:
         t = d["down_show"] + d["up_show"]
         d["pct"] = round((t / total_rate * 100) if total_rate else 0, 1)
-        d["download_val"], d["download_unit"] = split_human(d["down_show"], is_rate=d["is_rate"])
-        d["upload_val"], d["upload_unit"] = split_human(d["up_show"], is_rate=d["is_rate"])
-        # Gauge: for rates use Mbps-ish scale; for totals use larger scale
-        scale = 10_000_000 if d["is_rate"] else 50_000_000
-        d["down_pct"] = meter_pct_from_rate(d["down_show"], scale)
-        d["up_pct"] = meter_pct_from_rate(d["up_show"], scale)
+        scale = 5_000_000 if d["is_rate"] else 50_000_000
+        d["down_pct"] = meter_pct(d["down_show"], scale)
+        d["up_pct"] = meter_pct(d["up_show"], scale)
         d["down_arc"] = f"{d['down_pct'] / 100 * ARC_LEN:.2f}"
         d["up_arc"] = f"{d['up_pct'] / 100 * ARC_LEN:.2f}"
 
@@ -516,22 +492,20 @@ def group_devices(devices):
 
 def snapshot_payload():
     devices = load_devices()
-    slim = []
-    for d in devices:
-        slim.append({
-            "mac": d["mac"],
-            "ip": d["ip"],
-            "glow": d["glow"],
-            "badge_class": d["badge_class"],
-            "status_label": d["status_label"],
-            "download_val": d["download_val"],
-            "download_unit": d["download_unit"],
-            "upload_val": d["upload_val"],
-            "upload_unit": d["upload_unit"],
-            "down_arc": d["down_arc"],
-            "up_arc": d["up_arc"],
-            "pct": d["pct"],
-        })
+    slim = [{
+        "mac": d["mac"],
+        "ip": d["ip"],
+        "glow": d["glow"],
+        "badge_class": d["badge_class"],
+        "status_label": d["status_label"],
+        "download_val": d["download_val"],
+        "download_unit": d["download_unit"],
+        "upload_val": d["upload_val"],
+        "upload_unit": d["upload_unit"],
+        "down_arc": d["down_arc"],
+        "up_arc": d["up_arc"],
+        "pct": d["pct"],
+    } for d in devices]
     return {
         "type": "snapshot",
         "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -551,8 +525,7 @@ def index():
 
 @app.route("/device/<mac>")
 def device(mac):
-    mac = mac.upper()
-    d = next((x for x in load_devices() if x["mac"] == mac), None)
+    d = next((x for x in load_devices() if x["mac"] == mac.upper()), None)
     if not d:
         return "Device not found", 404
     return render_template_string(DETAIL_TPL, d=d)
@@ -564,7 +537,6 @@ def action():
 
 @sock.route("/ws")
 def ws_traffic(ws):
-    """Stream device traffic snapshots over WebSocket."""
     while True:
         try:
             ws.send(json.dumps(snapshot_payload()))
@@ -573,5 +545,4 @@ def ws_traffic(ws):
         time.sleep(2)
 
 if __name__ == "__main__":
-    # 8080 = no root; change to 80 + sudo if you prefer
     app.run(host="0.0.0.0", port=8080, debug=False)
